@@ -24,6 +24,12 @@ interface SpeakerLine {
   time: string;
 }
 
+interface VoiceProfile {
+  centroid: number;   // спектральный центроид (тембр)
+  pitch: number;      // базовая частота голоса
+  samples: number;    // кол-во накопленных замеров
+}
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const SPEAKER_COLORS = [
@@ -69,12 +75,45 @@ const FAQS = [
   { q: "Это действительно бесплатно?", a: "Да, сервис полностью бесплатный. Никаких скрытых платежей, подписок или лимитов." },
   { q: "Какие языки поддерживаются?", a: "Русский, английский, немецкий, французский, испанский, итальянский, китайский и другие." },
   { q: "Нужно ли устанавливать программу?", a: "Нет, сервис работает прямо в браузере. Никаких загрузок и установок." },
-  { q: "Как работает распознавание нескольких голосов?", a: "При записи через микрофон сервис отслеживает паузы между репликами. Вы можете вручную указать смену спикера или переключать кнопки спикеров. Каждая реплика помечается меткой и цветом." },
+  { q: "Как работает автоматическое определение спикеров?", a: "Сервис анализирует тембр и частоту голоса через Web Audio API в реальном времени. Каждый новый уникальный голос получает свой цвет и метку. До 4 спикеров одновременно — всё происходит автоматически, без ручной настройки." },
   { q: "Какие форматы файлов можно загружать?", a: "MP3, WAV, OGG, WEBM, M4A — любые аудиоформаты, которые поддерживает ваш браузер." },
   { q: "Как экспортировать текст?", a: "Нажмите кнопку «Экспорт» и выберите формат: TXT, DOCX или PDF. Файл скачается автоматически." },
 ];
 
 const LANGUAGES = ["Русский 🇷🇺", "English 🇺🇸", "Deutsch 🇩🇪", "Français 🇫🇷", "Español 🇪🇸", "中文 🇨🇳"];
+
+// ─── Voice fingerprint helpers ───────────────────────────────────────────────
+
+function getSpectralCentroid(freqData: Uint8Array, sampleRate: number): number {
+  let weightedSum = 0;
+  let totalMag = 0;
+  const binWidth = sampleRate / (freqData.length * 2);
+  for (let i = 1; i < freqData.length; i++) {
+    const mag = freqData[i];
+    weightedSum += mag * i * binWidth;
+    totalMag += mag;
+  }
+  return totalMag > 0 ? weightedSum / totalMag : 0;
+}
+
+function getDominantPitch(freqData: Uint8Array, sampleRate: number): number {
+  let maxMag = 0;
+  let maxIdx = 0;
+  const binWidth = sampleRate / (freqData.length * 2);
+  // Голос: 80–400 Hz
+  const minBin = Math.floor(80 / binWidth);
+  const maxBin = Math.floor(400 / binWidth);
+  for (let i = minBin; i < Math.min(maxBin, freqData.length); i++) {
+    if (freqData[i] > maxMag) { maxMag = freqData[i]; maxIdx = i; }
+  }
+  return maxIdx * binWidth;
+}
+
+function voiceDistance(a: VoiceProfile, b: VoiceProfile): number {
+  const dc = Math.abs(a.centroid - b.centroid) / 1000;
+  const dp = Math.abs(a.pitch - b.pitch) / 200;
+  return dc * 0.6 + dp * 0.4;
+}
 
 // ─── Utils ───────────────────────────────────────────────────────────────────
 
@@ -457,6 +496,9 @@ function SpeakerView({ lines, onEdit }: { lines: SpeakerLine[]; onEdit: (idx: nu
 
 // ─── Hero Section ─────────────────────────────────────────────────────────────
 
+const MATCH_THRESHOLD = 0.45; // дистанция ниже → тот же спикер
+const MIN_ENERGY = 12;         // порог громкости для замера
+
 function HeroSection() {
   const [mode, setMode] = useState<"mic" | "file">("mic");
   const [isRecording, setIsRecording] = useState(false);
@@ -465,16 +507,114 @@ function HeroSection() {
   const [plainText, setPlainText] = useState("");
   const [lang, setLang] = useState("ru-RU");
   const [activeSpeaker, setActiveSpeaker] = useState(0);
-  const [speakerCount, setSpeakerCount] = useState(1);
+  const [detectedCount, setDetectedCount] = useState(0);
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
-  const lastFinalTimeRef = useRef(Date.now());
-  const SPEAKER_PAUSE_MS = 2800;
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const profilesRef = useRef<VoiceProfile[]>([]);
+  const freqSnapshotRef = useRef<{ centroid: number; pitch: number } | null>(null);
+  const samplingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activeSpeakerRef = useRef(0);
 
-  const startRecording = () => {
+  // держим ref синхронизированным со state
+  useEffect(() => { activeSpeakerRef.current = activeSpeaker; }, [activeSpeaker]);
+
+  const startAudioAnalysis = useCallback((stream: MediaStream) => {
+    const ctx = new AudioContext();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.5;
+    const source = ctx.createMediaStreamSource(stream);
+    source.connect(analyser);
+    audioCtxRef.current = ctx;
+    analyserRef.current = analyser;
+    sourceRef.current = source;
+
+    const freqData = new Uint8Array(analyser.frequencyBinCount);
+    samplingRef.current = setInterval(() => {
+      analyser.getByteFrequencyData(freqData);
+      const energy = freqData.reduce((s, v) => s + v, 0) / freqData.length;
+      if (energy < MIN_ENERGY) { freqSnapshotRef.current = null; return; }
+      const centroid = getSpectralCentroid(freqData, ctx.sampleRate);
+      const pitch = getDominantPitch(freqData, ctx.sampleRate);
+      freqSnapshotRef.current = { centroid, pitch };
+    }, 80);
+  }, []);
+
+  const stopAudioAnalysis = useCallback(() => {
+    if (samplingRef.current) clearInterval(samplingRef.current);
+    sourceRef.current?.disconnect();
+    audioCtxRef.current?.close();
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    audioCtxRef.current = null;
+    analyserRef.current = null;
+    sourceRef.current = null;
+    streamRef.current = null;
+    freqSnapshotRef.current = null;
+  }, []);
+
+  const classifySpeaker = useCallback((): number => {
+    const snap = freqSnapshotRef.current;
+    if (!snap) return activeSpeakerRef.current;
+
+    const profiles = profilesRef.current;
+    const candidate: VoiceProfile = { centroid: snap.centroid, pitch: snap.pitch, samples: 1 };
+
+    if (profiles.length === 0) {
+      profilesRef.current = [candidate];
+      setDetectedCount(1);
+      return 0;
+    }
+
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    profiles.forEach((p, i) => {
+      const d = voiceDistance(p, candidate);
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    });
+
+    if (bestDist < MATCH_THRESHOLD) {
+      // обновляем профиль (скользящее среднее)
+      const p = profiles[bestIdx];
+      const n = p.samples + 1;
+      profilesRef.current[bestIdx] = {
+        centroid: (p.centroid * p.samples + candidate.centroid) / n,
+        pitch: (p.pitch * p.samples + candidate.pitch) / n,
+        samples: n,
+      };
+      return bestIdx;
+    }
+
+    // новый спикер (макс. 4)
+    if (profiles.length < SPEAKER_COLORS.length) {
+      profilesRef.current = [...profiles, candidate];
+      const idx = profiles.length;
+      setDetectedCount(idx + 1);
+      return idx;
+    }
+
+    return bestIdx; // если уже 4 — отдаём ближайшего
+  }, []);
+
+  const startRecording = useCallback(async () => {
     const w = window as Window & { SpeechRecognition?: new () => SpeechRecognitionInstance; webkitSpeechRecognition?: new () => SpeechRecognitionInstance };
     const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
     if (!Ctor) { alert("Ваш браузер не поддерживает распознавание. Используйте Chrome или Edge."); return; }
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      alert("Нет доступа к микрофону. Разрешите доступ в настройках браузера.");
+      return;
+    }
+    streamRef.current = stream;
+    startAudioAnalysis(stream);
+    profilesRef.current = [];
+    setDetectedCount(0);
 
     const rec = new Ctor();
     rec.lang = lang;
@@ -487,16 +627,8 @@ function HeroSection() {
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const t = e.results[i][0].transcript;
         if (e.results[i].isFinal) {
-          const curr = Date.now();
-          const gap = curr - lastFinalTimeRef.current;
-          lastFinalTimeRef.current = curr;
-
-          let speaker = activeSpeaker;
-          if (speakerCount > 1 && gap > SPEAKER_PAUSE_MS) {
-            speaker = (activeSpeaker + 1) % speakerCount;
-            setActiveSpeaker(speaker);
-          }
-
+          const speaker = classifySpeaker();
+          setActiveSpeaker(speaker);
           setSpeakerLines((prev) => [...prev, { speaker, text: t.trim(), time: now() }]);
           setPlainText((prev) => (prev ? prev + " " + t.trim() : t.trim()));
           setTranscript("");
@@ -506,14 +638,21 @@ function HeroSection() {
       }
       if (interim) setTranscript(interim);
     };
-    rec.onerror = () => setIsRecording(false);
-    rec.onend = () => { setIsRecording(false); setTranscript(""); };
+
+    rec.onerror = () => { setIsRecording(false); stopAudioAnalysis(); };
+    rec.onend = () => { setIsRecording(false); setTranscript(""); stopAudioAnalysis(); };
     recognitionRef.current = rec;
     rec.start();
     setIsRecording(true);
-  };
+  }, [lang, startAudioAnalysis, stopAudioAnalysis, classifySpeaker]);
 
-  const stopRecording = () => { recognitionRef.current?.stop(); setIsRecording(false); setTranscript(""); };
+  const stopRecording = useCallback(() => {
+    recognitionRef.current?.stop();
+    stopAudioAnalysis();
+    setIsRecording(false);
+    setTranscript("");
+  }, [stopAudioAnalysis]);
+
   const handleMic = () => { if (isRecording) stopRecording(); else startRecording(); };
 
   const handleFileResult = (lines: SpeakerLine[], plain: string) => {
@@ -525,10 +664,20 @@ function HeroSection() {
     setSpeakerLines((prev) => prev.map((l, i) => i === idx ? { ...l, text } : l));
   };
 
-  const clearAll = () => { setSpeakerLines([]); setPlainText(""); setTranscript(""); };
-  const copyText = () => { const t = speakerLines.length > 0 ? speakerLinesToText(speakerLines) : plainText; if (t) navigator.clipboard.writeText(t); };
+  const clearAll = () => {
+    setSpeakerLines([]);
+    setPlainText("");
+    setTranscript("");
+    profilesRef.current = [];
+    setDetectedCount(0);
+  };
+  const copyText = () => {
+    const t = speakerLines.length > 0 ? speakerLinesToText(speakerLines) : plainText;
+    if (t) navigator.clipboard.writeText(t);
+  };
 
   const hasContent = speakerLines.length > 0 || plainText.length > 0;
+  const currentSp = SPEAKER_COLORS[activeSpeaker] ?? SPEAKER_COLORS[0];
 
   return (
     <section id="hero" className="relative min-h-screen flex flex-col items-center justify-center px-4 py-24 mesh-bg overflow-hidden">
@@ -547,7 +696,7 @@ function HeroSection() {
         </h1>
         <p className="text-muted-foreground text-lg md:text-xl max-w-xl mx-auto font-body leading-relaxed">
           Говорите или загрузите аудио — сервис мгновенно преобразует речь в текст.<br />
-          Мульти-спикер, экспорт DOC/DOCX/PDF, редактор.
+          Авто-определение спикеров, экспорт DOC/DOCX/PDF, редактор.
         </p>
       </div>
 
@@ -576,41 +725,35 @@ function HeroSection() {
           {/* Mic mode */}
           {mode === "mic" && (
             <>
-              {/* Speaker controls */}
+              {/* Status bar */}
               <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
-                <div className="flex items-center gap-2">
-                  <span className="text-muted-foreground text-sm font-body">Спикеров:</span>
-                  {[1, 2, 3, 4].map((n) => (
-                    <button
-                      key={n}
-                      onClick={() => { setSpeakerCount(n); if (activeSpeaker >= n) setActiveSpeaker(0); }}
-                      className={`w-7 h-7 rounded-lg text-xs font-display font-bold transition-all ${speakerCount === n ? "bg-neon-orange text-white" : "bg-muted text-muted-foreground hover:text-foreground"}`}
-                    >
-                      {n}
-                    </button>
-                  ))}
-                </div>
-                {speakerCount > 1 && (
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-muted-foreground text-xs font-body">Активный:</span>
-                    {Array.from({ length: speakerCount }, (_, i) => (
-                      <button
-                        key={i}
-                        onClick={() => setActiveSpeaker(i)}
-                        className={`px-3 py-1 rounded-lg text-xs font-display font-bold transition-all border ${
-                          activeSpeaker === i
-                            ? `${SPEAKER_COLORS[i].bg} ${SPEAKER_COLORS[i].border} ${SPEAKER_COLORS[i].accent}`
-                            : "bg-muted border-border text-muted-foreground"
-                        }`}
-                      >
-                        {SPEAKER_COLORS[i]?.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
-                <div className="flex items-center gap-2 ml-auto">
+                <div className="flex items-center gap-3">
                   <WaveVisualizer active={isRecording} />
-                  {isRecording && <span className="text-neon-orange text-xs font-body animate-pulse">Запись...</span>}
+                  {isRecording && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-neon-orange text-xs font-body animate-pulse">Запись...</span>
+                      {detectedCount > 0 && (
+                        <div className="flex items-center gap-1">
+                          {Array.from({ length: detectedCount }, (_, i) => (
+                            <span
+                              key={i}
+                              className={`w-2 h-2 rounded-full transition-all ${i === activeSpeaker ? "scale-125" : "opacity-40"}`}
+                              style={{ backgroundColor: SPEAKER_COLORS[i]?.dot ?? "#888" }}
+                            />
+                          ))}
+                          <span className="text-xs font-body text-muted-foreground ml-1">
+                            {detectedCount === 1 ? "1 голос" : `${detectedCount} голоса`}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 ml-auto">
+                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-muted border border-border">
+                    <Icon name="Brain" size={12} className="text-neon-purple" />
+                    <span className="text-xs font-body text-muted-foreground">Авто-спикер</span>
+                  </div>
                   <select
                     value={lang}
                     onChange={(e) => setLang(e.target.value)}
@@ -626,8 +769,8 @@ function HeroSection() {
                 <div className="mb-4">
                   <SpeakerView lines={speakerLines} onEdit={editLine} />
                   {transcript && (
-                    <div className={`mt-2 px-4 py-2 rounded-xl border ${SPEAKER_COLORS[activeSpeaker]?.border} ${SPEAKER_COLORS[activeSpeaker]?.bg} text-sm font-body text-muted-foreground italic`}>
-                      {SPEAKER_COLORS[activeSpeaker]?.label}: {transcript}
+                    <div className={`mt-2 px-4 py-2 rounded-xl border ${currentSp.border} ${currentSp.bg} text-sm font-body text-muted-foreground italic`}>
+                      <span className={`font-semibold ${currentSp.accent}`}>{currentSp.label}:</span> {transcript}
                     </div>
                   )}
                 </div>

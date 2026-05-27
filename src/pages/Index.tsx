@@ -465,145 +465,117 @@ function TranscriptSavePanel({ lines, plain, fileName }: { lines: SpeakerLine[];
 
 // ─── Audio File Uploader ──────────────────────────────────────────────────────
 
+const WHISPER_URL = "https://functions.poehali.dev/2c9ac17b-b681-4f85-9399-c68876c7bef7";
+
+// Лимит Whisper API — 25 МБ
+const MAX_FILE_MB = 25;
+
 function AudioUploader({ lang, onResult }: { lang: string; onResult: (lines: SpeakerLine[], plain: string) => void }) {
-  // Стадии: idle → ready (файл загружен) → recording (идёт воспроизведение+запись) → done | error
-  const [status, setStatus] = useState<"idle" | "ready" | "recording" | "done" | "error">("idle");
+  const [status, setStatus] = useState<"idle" | "uploading" | "done" | "error">("idle");
   const [fileName, setFileName] = useState("");
-  const [fileUrl, setFileUrl] = useState("");
-  const [audioDuration, setAudioDuration] = useState(0);
-  const [currentTime, setCurrentTime] = useState(0);
+  const [fileSize, setFileSize] = useState(0);
+  const [errorMsg, setErrorMsg] = useState("");
+  const [progress, setProgress] = useState(0);
   const [resultLines, setResultLines] = useState<SpeakerLine[]>([]);
   const [resultPlain, setResultPlain] = useState("");
 
   const inputRef = useRef<HTMLInputElement>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const recRef = useRef<SpeechRecognitionInstance | null>(null);
-  const linesRef = useRef<SpeakerLine[]>([]);
-  const plainPartsRef = useRef<string[]>([]);
-  const lastFinalTimeRef = useRef(Date.now());
-  const speakerIdxRef = useRef(0);
-  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const SPEAKER_PAUSE_MS = 2500;
-
-  const resetAll = useCallback(() => {
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current.src = ""; }
-    if (recRef.current) { try { recRef.current.abort(); } catch { /* ok */ } }
-    if (tickRef.current) clearInterval(tickRef.current);
-    if (fileUrl) URL.revokeObjectURL(fileUrl);
-    setFileUrl("");
-    setFileName("");
-    setAudioDuration(0);
-    setCurrentTime(0);
-    setResultLines([]);
-    setResultPlain("");
-    linesRef.current = [];
-    plainPartsRef.current = [];
-    speakerIdxRef.current = 0;
+  const resetAll = () => {
+    abortRef.current?.abort();
+    if (progressTimerRef.current) clearInterval(progressTimerRef.current);
     setStatus("idle");
-  }, [fileUrl]);
-
-  const loadFile = useCallback((file: File) => {
-    if (fileUrl) URL.revokeObjectURL(fileUrl);
-    const url = URL.createObjectURL(file);
-    setFileUrl(url);
-    setFileName(file.name);
-    setStatus("ready");
-    setCurrentTime(0);
+    setFileName("");
+    setFileSize(0);
+    setProgress(0);
+    setErrorMsg("");
     setResultLines([]);
     setResultPlain("");
-    linesRef.current = [];
-    plainPartsRef.current = [];
-    speakerIdxRef.current = 0;
+  };
 
-    const audio = new Audio(url);
-    audioRef.current = audio;
-    audio.addEventListener("loadedmetadata", () => setAudioDuration(audio.duration));
-    audio.addEventListener("timeupdate", () => setCurrentTime(audio.currentTime));
-  }, [fileUrl]);
+  // Языковой код для Whisper (ISO-639-1)
+  const whisperLang = lang.split("-")[0];
 
-  const startTranscription = useCallback(() => {
-    const w = window as Window & { SpeechRecognition?: new () => SpeechRecognitionInstance; webkitSpeechRecognition?: new () => SpeechRecognitionInstance };
-    const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (!Ctor) { setStatus("error"); return; }
+  const processFile = useCallback(async (file: File) => {
+    if (file.size > MAX_FILE_MB * 1024 * 1024) {
+      setErrorMsg(`Файл слишком большой. Максимум ${MAX_FILE_MB} МБ.`);
+      setStatus("error");
+      return;
+    }
 
-    const audio = audioRef.current;
-    if (!audio) return;
+    setFileName(file.name);
+    setFileSize(file.size);
+    setStatus("uploading");
+    setProgress(0);
+    setResultLines([]);
+    setResultPlain("");
 
-    linesRef.current = [];
-    plainPartsRef.current = [];
-    speakerIdxRef.current = 0;
-    lastFinalTimeRef.current = Date.now();
+    // Симулируем прогресс (реальный прогресс через XHR не нужен — Whisper быстрый)
+    let fakeProgress = 0;
+    progressTimerRef.current = setInterval(() => {
+      fakeProgress += fakeProgress < 60 ? 3 : fakeProgress < 85 ? 1 : 0.3;
+      setProgress(Math.min(92, Math.round(fakeProgress)));
+    }, 400);
 
-    const rec = new Ctor();
-    rec.lang = lang;
-    rec.continuous = true;
-    rec.interimResults = false;
-    rec.maxAlternatives = 1;
+    try {
+      // Читаем файл как base64
+      const arrayBuffer = await file.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuffer);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      const b64 = btoa(binary);
 
-    rec.onresult = (e: SpeechRecognitionEvent) => {
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) {
-          const text = e.results[i][0].transcript.trim();
-          if (!text) continue;
-          const t = Date.now();
-          if (t - lastFinalTimeRef.current > SPEAKER_PAUSE_MS && linesRef.current.length > 0) {
-            speakerIdxRef.current = (speakerIdxRef.current + 1) % SPEAKER_COLORS.length;
-          }
-          lastFinalTimeRef.current = t;
-          linesRef.current.push({ speaker: speakerIdxRef.current, text, time: now() });
-          plainPartsRef.current.push(text);
-        }
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      const resp = await fetch(WHISPER_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ audio: b64, language: whisperLang, fileName: file.name }),
+        signal: controller.signal,
+      });
+
+      if (progressTimerRef.current) clearInterval(progressTimerRef.current);
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+        throw new Error(err.error || `Ошибка сервера ${resp.status}`);
       }
-    };
 
-    rec.onend = () => {
-      if (tickRef.current) clearInterval(tickRef.current);
-      const lines = [...linesRef.current];
-      const plain = plainPartsRef.current.join(" ");
+      const data = await resp.json();
+      setProgress(100);
+
+      const lines: SpeakerLine[] = (data.lines ?? []).map((l: { speaker: number; text: string; time: string }) => ({
+        speaker: l.speaker,
+        text: l.text,
+        time: l.time,
+      }));
+      const plain: string = data.plain ?? "";
+
       setResultLines(lines);
       setResultPlain(plain);
       setStatus("done");
       onResult(lines, plain);
-    };
 
-    rec.onerror = () => {
-      if (tickRef.current) clearInterval(tickRef.current);
-      audio.pause();
+    } catch (e: unknown) {
+      if (progressTimerRef.current) clearInterval(progressTimerRef.current);
+      if (e instanceof Error && e.name === "AbortError") return;
+      setErrorMsg(e instanceof Error ? e.message : "Неизвестная ошибка");
       setStatus("error");
-    };
+    }
+  }, [whisperLang, onResult]);
 
-    recRef.current = rec;
+  const handleDrop = (e: React.DragEvent) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) processFile(f); };
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => { const f = e.target.files?.[0]; if (f) processFile(f); if (inputRef.current) inputRef.current.value = ""; };
 
-    // Запускаем одновременно: микрофон слушает, аудио играет через динамики
-    rec.start();
-    audio.currentTime = 0;
-    audio.play().catch(() => setStatus("error"));
-    setStatus("recording");
-
-    // Когда файл закончился — даём 2с на последние слова, потом стопаем recognition
-    audio.onended = () => {
-      setTimeout(() => {
-        try { rec.stop(); } catch { /* ok */ }
-      }, 2000);
-    };
-  }, [lang, onResult]);
-
-  const stopTranscription = useCallback(() => {
-    audioRef.current?.pause();
-    try { recRef.current?.stop(); } catch { /* ok */ }
-  }, []);
-
-  const handleDrop = (e: React.DragEvent) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) loadFile(f); };
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => { const f = e.target.files?.[0]; if (f) loadFile(f); if (inputRef.current) inputRef.current.value = ""; };
-
-  const formatDur = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
-  const progress = audioDuration > 0 ? Math.min(100, Math.round((currentTime / audioDuration) * 100)) : 0;
+  const formatSize = (b: number) => b > 1024 * 1024 ? `${(b / 1024 / 1024).toFixed(1)} МБ` : `${Math.round(b / 1024)} КБ`;
 
   return (
     <div className="space-y-4">
 
-      {/* Зона загрузки — только в idle */}
+      {/* idle — зона загрузки */}
       {status === "idle" && (
         <div
           onDrop={handleDrop}
@@ -618,107 +590,77 @@ function AudioUploader({ lang, onResult }: { lang: string; onResult: (lines: Spe
             </div>
             <div>
               <p className="font-body font-semibold text-foreground">Загрузите аудиофайл</p>
-              <p className="text-muted-foreground text-sm font-body mt-1">MP3, WAV, OGG, M4A, WEBM — перетащите или нажмите</p>
+              <p className="text-muted-foreground text-sm font-body mt-1">MP3, WAV, OGG, M4A, WEBM · до {MAX_FILE_MB} МБ</p>
+            </div>
+            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-neon-purple/10 border border-neon-purple/20">
+              <Icon name="Sparkles" size={12} className="text-neon-purple" />
+              <span className="text-xs font-body text-neon-purple font-semibold">OpenAI Whisper · точное распознавание</span>
             </div>
           </div>
         </div>
       )}
 
-      {/* Плеер + управление — после загрузки файла */}
-      {(status === "ready" || status === "recording" || status === "done") && (
-        <div className={`rounded-2xl border-2 transition-all duration-300 p-5 ${
-          status === "recording" ? "border-neon-orange/50 bg-neon-orange/5" :
-          status === "done" ? "border-green-500/40 bg-green-500/5" :
-          "border-border bg-card"
-        }`}>
-          {/* Файл-шапка */}
-          <div className="flex items-center gap-3 mb-4">
+      {/* uploading — прогресс */}
+      {status === "uploading" && (
+        <div className="rounded-2xl border-2 border-neon-purple/40 bg-neon-purple/5 p-6">
+          <div className="flex items-center gap-3 mb-5">
             <div className="w-10 h-10 rounded-lg bg-neon-purple/10 border border-neon-purple/30 flex items-center justify-center flex-shrink-0">
               <Icon name="FileAudio" size={18} className="text-neon-purple" />
             </div>
             <div className="flex-1 min-w-0">
               <p className="font-body font-semibold text-foreground text-sm truncate">{fileName}</p>
-              <p className="text-xs text-muted-foreground font-body">
-                {audioDuration > 0 ? formatDur(audioDuration) : "загрузка..."}
-                {status === "done" && <span className="ml-2 text-green-400">· транскрипция завершена</span>}
-              </p>
+              <p className="text-xs text-muted-foreground font-body">{formatSize(fileSize)}</p>
             </div>
-            <button onClick={resetAll} className="text-muted-foreground hover:text-foreground transition-colors flex-shrink-0">
-              <Icon name="X" size={16} />
-            </button>
           </div>
 
-          {/* Прогресс воспроизведения */}
-          <div className="mb-4">
-            <div className="h-1.5 bg-muted rounded-full overflow-hidden">
+          <div className="space-y-2 mb-5">
+            <div className="flex justify-between text-xs font-body text-muted-foreground">
+              <span className="flex items-center gap-1.5">
+                <Icon name="Sparkles" size={11} className="text-neon-purple" />
+                {progress < 20 ? "Загружаю файл..." : progress < 50 ? "Отправляю в Whisper..." : progress < 90 ? "Whisper распознаёт речь..." : "Финализирую..."}
+              </span>
+              <span className="text-neon-purple font-semibold">{progress}%</span>
+            </div>
+            <div className="h-2 bg-muted rounded-full overflow-hidden">
               <div
-                className={`h-full rounded-full transition-all duration-300 ${status === "recording" ? "bg-gradient-to-r from-neon-orange to-neon-purple" : "bg-muted-foreground/40"}`}
+                className="h-full bg-gradient-to-r from-neon-purple to-neon-orange rounded-full transition-all duration-500"
                 style={{ width: `${progress}%` }}
               />
             </div>
-            <div className="flex justify-between text-xs text-muted-foreground font-body mt-1">
-              <span>{formatDur(currentTime)}</span>
-              <span>{audioDuration > 0 ? formatDur(audioDuration) : "--:--"}</span>
-            </div>
           </div>
 
-          {/* Кнопки управления */}
-          {status === "ready" && (
-            <div className="space-y-3">
-              <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-neon-orange/10 border border-neon-orange/20">
-                <Icon name="Info" size={14} className="text-neon-orange mt-0.5 flex-shrink-0" />
-                <p className="text-xs font-body text-muted-foreground leading-relaxed">
-                  Убедитесь, что <strong className="text-foreground">микрофон и динамики включены</strong>. Сервис воспроизведёт файл через колонки и одновременно запишет речь через микрофон.
-                </p>
-              </div>
-              <button
-                onClick={startTranscription}
-                className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-gradient-to-r from-neon-orange to-neon-purple text-white font-display font-semibold text-sm hover:opacity-90 transition-all"
-              >
-                <Icon name="Play" size={16} />
-                Начать транскрибацию
-              </button>
-            </div>
-          )}
-
-          {status === "recording" && (
-            <div className="flex items-center gap-3">
-              <div className="flex-1 flex items-center gap-2">
-                <WaveVisualizer active color="bg-neon-orange" />
-                <span className="text-neon-orange text-xs font-body animate-pulse">Идёт запись...</span>
-              </div>
-              <button
-                onClick={stopTranscription}
-                className="flex items-center gap-2 px-4 py-2 rounded-xl border border-red-500/40 bg-red-500/10 text-red-400 text-sm font-body hover:bg-red-500/20 transition-all"
-              >
-                <Icon name="Square" size={14} />
-                Стоп
-              </button>
-            </div>
-          )}
-
-          {status === "done" && (
-            <button
-              onClick={resetAll}
-              className="w-full flex items-center justify-center gap-2 py-2 rounded-xl border border-border bg-muted hover:border-neon-purple/40 text-muted-foreground text-sm font-body transition-all"
-            >
-              <Icon name="Upload" size={14} />
-              Загрузить другой файл
-            </button>
-          )}
+          <button
+            onClick={resetAll}
+            className="text-xs text-muted-foreground hover:text-foreground font-body underline"
+          >
+            Отменить
+          </button>
         </div>
       )}
 
-      {/* Ошибка */}
+      {/* done — шапка файла */}
+      {status === "done" && (
+        <div className="rounded-2xl border border-green-500/30 bg-green-500/5 p-4 flex items-center gap-3">
+          <Icon name="CheckCircle" size={20} className="text-green-400 flex-shrink-0" />
+          <div className="flex-1 min-w-0">
+            <p className="font-body font-semibold text-foreground text-sm truncate">{fileName}</p>
+            <p className="text-xs text-muted-foreground font-body">
+              {resultLines.length > 0 ? `${resultLines.length} реплик` : `${resultPlain.split(/\s+/).filter(Boolean).length} слов`} · Whisper
+            </p>
+          </div>
+          <button onClick={resetAll} className="text-muted-foreground hover:text-foreground transition-colors flex-shrink-0">
+            <Icon name="X" size={16} />
+          </button>
+        </div>
+      )}
+
+      {/* error */}
       {status === "error" && (
         <div className="rounded-2xl border border-red-500/30 bg-red-500/5 p-5 flex flex-col items-center gap-3 text-center">
           <Icon name="AlertCircle" size={28} className="text-red-400" />
           <div>
-            <p className="font-body font-semibold text-foreground mb-1">Не удалось распознать речь</p>
-            <p className="text-xs text-muted-foreground font-body">
-              Проверьте доступ к микрофону в настройках браузера.<br />
-              Используйте Chrome или Edge. Звук должен воспроизводиться через динамики.
-            </p>
+            <p className="font-body font-semibold text-foreground mb-1">Ошибка распознавания</p>
+            <p className="text-xs text-muted-foreground font-body">{errorMsg || "Попробуйте ещё раз или проверьте ключ OpenAI."}</p>
           </div>
           <button onClick={resetAll} className="px-4 py-2 rounded-xl border border-border bg-muted text-sm font-body text-foreground hover:border-neon-orange/40 transition-all">
             Попробовать снова
@@ -1102,7 +1044,10 @@ function HeroSection() {
                 >
                   {LANG_OPTIONS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
                 </select>
-                <p className="text-muted-foreground text-xs font-body">Спикеры определяются по паузам в аудио</p>
+                <div className="flex items-center gap-1.5">
+                    <Icon name="Sparkles" size={12} className="text-neon-purple" />
+                    <span className="text-muted-foreground text-xs font-body">OpenAI Whisper · авто-определение спикеров</span>
+                  </div>
               </div>
 
               <AudioUploader lang={lang} onResult={handleFileResult} />

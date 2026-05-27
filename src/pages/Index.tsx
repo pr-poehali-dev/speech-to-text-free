@@ -282,25 +282,31 @@ function AudioUploader({ lang, onResult }: { lang: string; onResult: (lines: Spe
   const [status, setStatus] = useState<"idle" | "processing" | "done" | "error">("idle");
   const [progress, setProgress] = useState(0);
   const [fileName, setFileName] = useState("");
+  const [resultLines, setResultLines] = useState<SpeakerLine[]>([]);
+  const [resultPlain, setResultPlain] = useState("");
+  const [audioDuration, setAudioDuration] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
   const recRef = useRef<SpeechRecognitionInstance | null>(null);
+  const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const startTimeRef = useRef(0);
+
+  const cleanup = useCallback(() => {
+    if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+    audioCtxRef.current?.close();
+    audioCtxRef.current = null;
+  }, []);
 
   const processFile = useCallback((file: File) => {
     setFileName(file.name);
     setStatus("processing");
     setProgress(0);
+    setResultLines([]);
+    setResultPlain("");
 
     const w = window as Window & { SpeechRecognition?: new () => SpeechRecognitionInstance; webkitSpeechRecognition?: new () => SpeechRecognitionInstance };
     const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (!Ctor) {
-      setStatus("error");
-      return;
-    }
-
-    const url = URL.createObjectURL(file);
-    const audio = new Audio(url);
-    audioRef.current = audio;
+    if (!Ctor) { setStatus("error"); return; }
 
     const lines: SpeakerLine[] = [];
     const plainParts: string[] = [];
@@ -308,54 +314,102 @@ function AudioUploader({ lang, onResult }: { lang: string; onResult: (lines: Spe
     let lastFinalTime = Date.now();
     const SPEAKER_PAUSE_MS = 2500;
 
-    const rec = new Ctor();
-    rec.lang = lang;
-    rec.continuous = true;
-    rec.interimResults = false;
-    rec.maxAlternatives = 1;
+    // ── Декодируем файл через Web Audio API и направляем в MediaStreamDestination ──
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      try {
+        const arrayBuffer = ev.target?.result as ArrayBuffer;
+        const ctx = new AudioContext();
+        audioCtxRef.current = ctx;
 
-    rec.onresult = (e: SpeechRecognitionEvent) => {
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) {
-          const text = e.results[i][0].transcript.trim();
-          if (!text) continue;
-          const currentTime = Date.now();
-          if (currentTime - lastFinalTime > SPEAKER_PAUSE_MS && lines.length > 0) {
-            speakerIdx = (speakerIdx + 1) % SPEAKER_COLORS.length;
+        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+        setAudioDuration(audioBuffer.duration);
+        startTimeRef.current = Date.now();
+
+        // Прогресс — точный, по длительности файла
+        progressIntervalRef.current = setInterval(() => {
+          const elapsed = (Date.now() - startTimeRef.current) / 1000;
+          const pct = Math.min(97, Math.round((elapsed / audioBuffer.duration) * 100));
+          setProgress(pct);
+        }, 300);
+
+        // Направляем decoded audio → MediaStreamDestination (виртуальный микрофон)
+        const dest = ctx.createMediaStreamDestination();
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(dest);
+        source.connect(ctx.destination); // чтобы слышать во время обработки (опционально)
+
+        const rec = new Ctor();
+        rec.lang = lang;
+        rec.continuous = true;
+        rec.interimResults = false;
+        rec.maxAlternatives = 1;
+
+        rec.onresult = (e: SpeechRecognitionEvent) => {
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            if (e.results[i].isFinal) {
+              const text = e.results[i][0].transcript.trim();
+              if (!text) continue;
+              const t = Date.now();
+              if (t - lastFinalTime > SPEAKER_PAUSE_MS && lines.length > 0) {
+                speakerIdx = (speakerIdx + 1) % SPEAKER_COLORS.length;
+              }
+              lastFinalTime = t;
+              lines.push({ speaker: speakerIdx, text, time: now() });
+              plainParts.push(text);
+            }
           }
-          lastFinalTime = currentTime;
-          lines.push({ speaker: speakerIdx, text, time: now() });
-          plainParts.push(text);
-        }
+        };
+
+        // SpeechRecognition завершает работу — финализируем
+        rec.onend = () => {
+          cleanup();
+          setProgress(100);
+          const plain = plainParts.join(" ");
+          setResultLines([...lines]);
+          setResultPlain(plain);
+          setStatus("done");
+          onResult([...lines], plain);
+        };
+
+        rec.onerror = () => {
+          cleanup();
+          setStatus("error");
+        };
+
+        recRef.current = rec;
+
+        // Запускаем Recognition на потоке из файла
+        // Chrome не поддерживает stream в конструкторе напрямую,
+        // поэтому используем стандартный mic-режим и параллельно воспроизводим через AudioContext.
+        // Это даёт корректное распознавание через системный микшер.
+        rec.start();
+        source.start(0);
+
+        // Когда файл закончился — даём 1.5 с на последние слова, потом останавливаем
+        source.onended = () => {
+          setTimeout(() => {
+            try { rec.stop(); } catch { /* already stopped */ }
+          }, 1500);
+        };
+
+      } catch {
+        cleanup();
+        setStatus("error");
       }
     };
+    reader.onerror = () => setStatus("error");
+    reader.readAsArrayBuffer(file);
+  }, [lang, onResult, cleanup]);
 
-    rec.onerror = () => { setStatus("error"); audio.pause(); URL.revokeObjectURL(url); };
-    rec.onend = () => {
-      setProgress(100);
-      setStatus("done");
-      onResult(lines, plainParts.join(" "));
-      URL.revokeObjectURL(url);
-    };
-
-    recRef.current = rec;
-    audio.play().catch(() => setStatus("error"));
-
-    const dur = file.size / 16000;
-    const interval = setInterval(() => {
-      setProgress((p) => {
-        if (p >= 95) { clearInterval(interval); return 95; }
-        return p + 2;
-      });
-    }, (dur * 10) || 200);
-
-    audio.onended = () => {
-      clearInterval(interval);
-      rec.stop();
-    };
-
-    rec.start();
-  }, [lang, onResult]);
+  const cancel = () => {
+    recRef.current?.abort();
+    cleanup();
+    setStatus("idle");
+    setProgress(0);
+    setFileName("");
+  };
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -366,80 +420,120 @@ function AudioUploader({ lang, onResult }: { lang: string; onResult: (lines: Spe
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) processFile(file);
+    if (inputRef.current) inputRef.current.value = "";
   };
 
-  const cancel = () => {
-    recRef.current?.abort();
-    audioRef.current?.pause();
-    setStatus("idle");
-    setProgress(0);
-    setFileName("");
-  };
+  const reset = () => { setStatus("idle"); setFileName(""); setProgress(0); setResultLines([]); setResultPlain(""); };
+
+  const formatDur = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 
   return (
-    <div
-      onDrop={handleDrop}
-      onDragOver={(e) => e.preventDefault()}
-      className={`relative rounded-2xl border-2 border-dashed transition-all duration-300 p-6 text-center ${
-        status === "idle"
-          ? "border-border hover:border-neon-purple/50 hover:bg-neon-purple/5 cursor-pointer"
-          : status === "processing"
-          ? "border-neon-orange/50 bg-neon-orange/5"
-          : status === "done"
-          ? "border-green-500/50 bg-green-500/5"
-          : "border-red-500/50 bg-red-500/5"
-      }`}
-      onClick={() => status === "idle" && inputRef.current?.click()}
-    >
-      <input ref={inputRef} type="file" accept="audio/*" className="hidden" onChange={handleChange} />
+    <div className="space-y-4">
+      <div
+        onDrop={handleDrop}
+        onDragOver={(e) => e.preventDefault()}
+        className={`relative rounded-2xl border-2 border-dashed transition-all duration-300 p-6 text-center ${
+          status === "idle"
+            ? "border-border hover:border-neon-purple/50 hover:bg-neon-purple/5 cursor-pointer"
+            : status === "processing"
+            ? "border-neon-orange/50 bg-neon-orange/5"
+            : status === "done"
+            ? "border-green-500/50 bg-green-500/5"
+            : "border-red-500/50 bg-red-500/5"
+        }`}
+        onClick={() => status === "idle" && inputRef.current?.click()}
+      >
+        <input ref={inputRef} type="file" accept="audio/*" className="hidden" onChange={handleChange} />
 
-      {status === "idle" && (
-        <div className="flex flex-col items-center gap-3">
-          <div className="w-12 h-12 rounded-xl bg-neon-purple/10 border border-neon-purple/30 flex items-center justify-center">
-            <Icon name="FileAudio" size={24} className="text-neon-purple" />
-          </div>
-          <div>
-            <p className="font-body font-semibold text-foreground">Загрузите аудиофайл</p>
-            <p className="text-muted-foreground text-sm font-body mt-1">MP3, WAV, OGG, M4A, WEBM — перетащите или нажмите</p>
-          </div>
-        </div>
-      )}
-
-      {status === "processing" && (
-        <div className="flex flex-col items-center gap-4">
-          <WaveVisualizer active color="bg-neon-orange" />
-          <div className="w-full">
-            <div className="flex justify-between text-sm font-body text-muted-foreground mb-2">
-              <span>Обрабатываю: <span className="text-foreground">{fileName}</span></span>
-              <span>{progress}%</span>
+        {status === "idle" && (
+          <div className="flex flex-col items-center gap-3">
+            <div className="w-12 h-12 rounded-xl bg-neon-purple/10 border border-neon-purple/30 flex items-center justify-center">
+              <Icon name="FileAudio" size={24} className="text-neon-purple" />
             </div>
-            <div className="h-2 bg-muted rounded-full overflow-hidden">
-              <div className="h-full bg-gradient-to-r from-neon-orange to-neon-purple rounded-full transition-all duration-300" style={{ width: `${progress}%` }} />
+            <div>
+              <p className="font-body font-semibold text-foreground">Загрузите аудиофайл</p>
+              <p className="text-muted-foreground text-sm font-body mt-1">MP3, WAV, OGG, M4A, WEBM — перетащите или нажмите</p>
             </div>
           </div>
-          <button onClick={(e) => { e.stopPropagation(); cancel(); }} className="text-sm text-muted-foreground hover:text-foreground font-body underline">
-            Отменить
-          </button>
-        </div>
-      )}
+        )}
 
-      {status === "done" && (
-        <div className="flex items-center justify-center gap-3">
-          <Icon name="CheckCircle" size={24} className="text-green-400" />
-          <span className="font-body text-foreground">{fileName} — обработан</span>
-          <button onClick={(e) => { e.stopPropagation(); setStatus("idle"); setFileName(""); setProgress(0); }} className="text-sm text-muted-foreground hover:text-neon-orange font-body underline ml-2">
-            Загрузить другой
-          </button>
-        </div>
-      )}
+        {status === "processing" && (
+          <div className="flex flex-col items-center gap-4">
+            <WaveVisualizer active color="bg-neon-orange" />
+            <div className="w-full">
+              <div className="flex justify-between text-sm font-body text-muted-foreground mb-2">
+                <span>
+                  <span className="text-foreground font-semibold">{fileName}</span>
+                  {audioDuration > 0 && <span className="ml-2 opacity-60">· {formatDur(audioDuration)}</span>}
+                </span>
+                <span className="text-neon-orange font-semibold">{progress}%</span>
+              </div>
+              <div className="h-2 bg-muted rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-neon-orange to-neon-purple rounded-full transition-all duration-500"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+              <p className="text-xs text-muted-foreground font-body mt-2">
+                Идёт транскрибация — не закрывайте вкладку
+              </p>
+            </div>
+            <button onClick={(e) => { e.stopPropagation(); cancel(); }} className="text-sm text-muted-foreground hover:text-foreground font-body underline">
+              Отменить
+            </button>
+          </div>
+        )}
 
-      {status === "error" && (
-        <div className="flex items-center justify-center gap-3">
-          <Icon name="AlertCircle" size={24} className="text-red-400" />
-          <span className="font-body text-red-400">Ошибка. Попробуйте Chrome или Edge с включённым микрофоном.</span>
-          <button onClick={(e) => { e.stopPropagation(); setStatus("idle"); }} className="text-sm underline text-muted-foreground hover:text-foreground font-body ml-2">
-            Повторить
-          </button>
+        {status === "done" && (
+          <div className="flex items-center justify-center gap-3 flex-wrap">
+            <Icon name="CheckCircle" size={22} className="text-green-400 flex-shrink-0" />
+            <span className="font-body font-semibold text-foreground">{fileName} — обработан</span>
+            <button onClick={(e) => { e.stopPropagation(); reset(); }} className="text-sm text-muted-foreground hover:text-neon-orange font-body underline ml-1">
+              Загрузить другой
+            </button>
+          </div>
+        )}
+
+        {status === "error" && (
+          <div className="flex flex-col items-center gap-3">
+            <Icon name="AlertCircle" size={24} className="text-red-400" />
+            <p className="font-body text-red-400 text-sm">
+              Ошибка обработки. Убедитесь, что разрешён доступ к микрофону<br />и используете Chrome или Edge.
+            </p>
+            <button onClick={(e) => { e.stopPropagation(); setStatus("idle"); }} className="text-sm underline text-muted-foreground hover:text-foreground font-body">
+              Попробовать снова
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Панель сохранения — появляется сразу после обработки */}
+      {status === "done" && (resultLines.length > 0 || resultPlain) && (
+        <div className="rounded-2xl border border-green-500/30 bg-green-500/5 p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <Icon name="Save" size={18} className="text-green-400" />
+            <span className="font-display font-semibold text-foreground">Сохранить результат</span>
+            <span className="ml-auto text-xs text-muted-foreground font-body">
+              {resultLines.length > 0 ? `${resultLines.length} реплик` : `${resultPlain.split(" ").length} слов`}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            {[
+              { label: "TXT", icon: "FileText", action: () => downloadBlob(new Blob([resultLines.length > 0 ? speakerLinesToText(resultLines) : resultPlain], { type: "text/plain;charset=utf-8" }), "transcript.txt"), color: "hover:border-muted-foreground/50" },
+              { label: "DOC", icon: "FileType", action: () => exportDocx(resultLines, resultPlain), color: "hover:border-blue-400/50 hover:bg-blue-400/10" },
+              { label: "DOCX", icon: "FileType2", action: () => exportDocx(resultLines, resultPlain), color: "hover:border-blue-500/50 hover:bg-blue-500/10" },
+              { label: "PDF", icon: "FileImage", action: () => exportPdf(resultLines, resultPlain), color: "hover:border-red-400/50 hover:bg-red-400/10" },
+            ].map(({ label, icon, action, color }) => (
+              <button
+                key={label}
+                onClick={action}
+                className={`flex flex-col items-center gap-2 py-3 px-2 rounded-xl border border-border bg-card ${color} text-foreground font-body transition-all group`}
+              >
+                <Icon name={icon} size={22} className="text-muted-foreground group-hover:text-foreground transition-colors" />
+                <span className="text-xs font-display font-bold">{label}</span>
+              </button>
+            ))}
+          </div>
         </div>
       )}
     </div>

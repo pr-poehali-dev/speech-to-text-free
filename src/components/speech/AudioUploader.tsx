@@ -331,26 +331,67 @@ export function SpeakerView({ lines, onEdit }: { lines: SpeakerLine[]; onEdit: (
 const WHISPER_URL = "https://functions.poehali.dev/2c9ac17b-b681-4f85-9399-c68876c7bef7";
 const MAX_FILE_MB = 150;
 
+const CHUNK_MB = 24;
+const CHUNK_BYTES = CHUNK_MB * 1024 * 1024;
+
+// Конвертирует ArrayBuffer → base64 без переполнения стека
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+// Отправляет один чанк на сервер, возвращает { lines, plain }
+async function sendChunk(
+  chunk: ArrayBuffer,
+  fileName: string,
+  whisperLang: string,
+  signal: AbortSignal,
+): Promise<{ lines: SpeakerLine[]; plain: string }> {
+  const b64 = arrayBufferToBase64(chunk);
+  const resp = await fetch(WHISPER_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ audio: b64, language: whisperLang, fileName }),
+    signal,
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+    throw new Error(err.error || `Ошибка сервера ${resp.status}`);
+  }
+  const data = await resp.json();
+  const lines: SpeakerLine[] = (data.lines ?? []).map((l: { speaker: number; text: string; time: string }) => ({
+    speaker: l.speaker,
+    text: l.text,
+    time: l.time,
+  }));
+  return { lines, plain: data.plain ?? "" };
+}
+
 export function AudioUploader({ lang, onResult }: { lang: string; onResult: (lines: SpeakerLine[], plain: string) => void }) {
   const [status, setStatus] = useState<"idle" | "uploading" | "done" | "error">("idle");
   const [fileName, setFileName] = useState("");
   const [fileSize, setFileSize] = useState(0);
   const [errorMsg, setErrorMsg] = useState("");
   const [progress, setProgress] = useState(0);
+  const [chunkInfo, setChunkInfo] = useState<{ current: number; total: number } | null>(null);
   const [resultLines, setResultLines] = useState<SpeakerLine[]>([]);
   const [resultPlain, setResultPlain] = useState("");
 
   const inputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const resetAll = () => {
     abortRef.current?.abort();
-    if (progressTimerRef.current) clearInterval(progressTimerRef.current);
     setStatus("idle");
     setFileName("");
     setFileSize(0);
     setProgress(0);
+    setChunkInfo(null);
     setErrorMsg("");
     setResultLines([]);
     setResultPlain("");
@@ -369,56 +410,62 @@ export function AudioUploader({ lang, onResult }: { lang: string; onResult: (lin
     setFileSize(file.size);
     setStatus("uploading");
     setProgress(0);
+    setChunkInfo(null);
     setResultLines([]);
     setResultPlain("");
 
-    let fakeProgress = 0;
-    progressTimerRef.current = setInterval(() => {
-      fakeProgress += fakeProgress < 60 ? 3 : fakeProgress < 85 ? 1 : 0.3;
-      setProgress(Math.min(92, Math.round(fakeProgress)));
-    }, 400);
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     try {
       const arrayBuffer = await file.arrayBuffer();
-      const bytes = new Uint8Array(arrayBuffer);
-      let binary = "";
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-      const b64 = btoa(binary);
 
-      const controller = new AbortController();
-      abortRef.current = controller;
+      // Разбиваем на чанки по CHUNK_BYTES
+      const totalChunks = Math.ceil(arrayBuffer.byteLength / CHUNK_BYTES);
+      setChunkInfo({ current: 0, total: totalChunks });
 
-      const resp = await fetch(WHISPER_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audio: b64, language: whisperLang, fileName: file.name }),
-        signal: controller.signal,
-      });
+      const allLines: SpeakerLine[] = [];
+      const allPlainParts: string[] = [];
+      // Смещение спикеров между чанками: последний speaker idx предыдущего чанка
+      let speakerOffset = 0;
 
-      if (progressTimerRef.current) clearInterval(progressTimerRef.current);
+      for (let i = 0; i < totalChunks; i++) {
+        if (controller.signal.aborted) return;
 
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
-        throw new Error(err.error || `Ошибка сервера ${resp.status}`);
+        setChunkInfo({ current: i + 1, total: totalChunks });
+        setProgress(Math.round((i / totalChunks) * 90));
+
+        const start = i * CHUNK_BYTES;
+        const end = Math.min(start + CHUNK_BYTES, arrayBuffer.byteLength);
+        const chunk = arrayBuffer.slice(start, end);
+
+        const ext = file.name.includes(".") ? file.name : `${file.name}.m4a`;
+        const { lines, plain } = await sendChunk(chunk, ext, whisperLang, controller.signal);
+
+        // Нормализуем индексы спикеров — смещаем relative to предыдущего чанка
+        const normalized = lines.map((l) => ({
+          ...l,
+          speaker: (l.speaker + speakerOffset) % 4,
+        }));
+
+        if (lines.length > 0) {
+          speakerOffset = (normalized[normalized.length - 1].speaker + 1) % 4;
+        }
+
+        allLines.push(...normalized);
+        if (plain.trim()) allPlainParts.push(plain.trim());
       }
 
-      const data = await resp.json();
       setProgress(100);
+      setChunkInfo(null);
 
-      const lines: SpeakerLine[] = (data.lines ?? []).map((l: { speaker: number; text: string; time: string }) => ({
-        speaker: l.speaker,
-        text: l.text,
-        time: l.time,
-      }));
-      const plain: string = data.plain ?? "";
-
-      setResultLines(lines);
-      setResultPlain(plain);
+      const finalPlain = allPlainParts.join(" ");
+      setResultLines(allLines);
+      setResultPlain(finalPlain);
       setStatus("done");
-      onResult(lines, plain);
+      onResult(allLines, finalPlain);
 
     } catch (e: unknown) {
-      if (progressTimerRef.current) clearInterval(progressTimerRef.current);
       if (e instanceof Error && e.name === "AbortError") return;
       setErrorMsg(e instanceof Error ? e.message : "Неизвестная ошибка");
       setStatus("error");
@@ -473,7 +520,9 @@ export function AudioUploader({ lang, onResult }: { lang: string; onResult: (lin
             <div className="flex justify-between text-xs font-body text-muted-foreground">
               <span className="flex items-center gap-1.5">
                 <Icon name="Sparkles" size={11} className="text-neon-purple" />
-                {progress < 20 ? "Загружаю файл..." : progress < 50 ? "Отправляю в Whisper..." : progress < 90 ? "Whisper распознаёт речь..." : "Финализирую..."}
+                {chunkInfo && chunkInfo.total > 1
+                  ? `Часть ${chunkInfo.current} из ${chunkInfo.total} — Whisper распознаёт...`
+                  : progress < 20 ? "Загружаю файл..." : progress < 50 ? "Отправляю в Whisper..." : progress < 90 ? "Whisper распознаёт речь..." : "Финализирую..."}
               </span>
               <span className="text-neon-purple font-semibold">{progress}%</span>
             </div>

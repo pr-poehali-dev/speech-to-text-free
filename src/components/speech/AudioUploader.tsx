@@ -329,7 +329,7 @@ export function SpeakerView({ lines, onEdit }: { lines: SpeakerLine[]; onEdit: (
 // ─── Audio Uploader ───────────────────────────────────────────────────────────
 
 const WHISPER_URL = "https://functions.poehali.dev/2c9ac17b-b681-4f85-9399-c68876c7bef7";
-const MAX_FILE_MB = 25;
+const MAX_FILE_MB = 150;
 
 export function AudioUploader({ lang, onResult }: { lang: string; onResult: (lines: SpeakerLine[], plain: string) => void }) {
   const [status, setStatus] = useState<"idle" | "uploading" | "done" | "error">("idle");
